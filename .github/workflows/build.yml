@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure
         run: cmake -S . -B build -A x64
@@ -31,7 +31,7 @@ jobs:
           "RDCManager.exe is {0:N0} bytes" -f $exe.Length
           "SHA-256: " + (Get-FileHash $exe -Algorithm SHA256).Hash
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: RDCManager
           path: build/Release/RDCManager.exe
@@ -45,7 +45,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: RDCManager
 
