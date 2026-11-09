@@ -1,0 +1,62 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Show exe size
+        shell: pwsh
+        run: |
+          $exe = Get-Item build/Release/RDCManager.exe
+          "RDCManager.exe is {0:N0} bytes" -f $exe.Length
+          "SHA-256: " + (Get-FileHash $exe -Algorithm SHA256).Hash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RDCManager
+          path: build/Release/RDCManager.exe
+          if-no-files-found: error
+
+  # Pushing a tag like v1.0.0 publishes a release with the exe built above.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: RDCManager
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $hash = (Get-FileHash RDCManager.exe -Algorithm SHA256).Hash
+          $notes = "Download **RDCManager.exe** below and run it. Nothing to install.`n`nSHA-256: ``$hash``"
+          gh release create "${{ github.ref_name }}" RDCManager.exe `
+            --repo "${{ github.repository }}" `
+            --title "RDC Manager ${{ github.ref_name }}" `
+            --notes $notes

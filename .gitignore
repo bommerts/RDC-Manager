@@ -1,0 +1,15 @@
+# build output
+/build/
+/build-*/
+/out/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+CMakeSettings.json
+CMakeUserPresets.json
+
+# editors
+.vscode/
+*.swp
