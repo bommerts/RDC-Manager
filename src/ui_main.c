@@ -10,6 +10,9 @@
 #define ID_LIST_BASE 1100
 #define ID_ABOUT     1200
 #define TIMER_MSTSC  1
+#define TIMER_ANIM   2                  /* rows sliding into place */
+#define TIMER_DRAG   3                  /* scrolls the list while a drag sits near its edge */
+#define ANIM_MS      150
 
 enum { V_COMPUTERS, V_DEFAULTS, V_CLEANUP, V_BACKUPS, V_ADVANCED, V_COUNT };
 
@@ -20,7 +23,8 @@ enum {
     CM_D_EDIT, CM_D_ADD, CM_D_DELETE, CM_D_NOTEPAD, CM_D_RESET,
     CM_X_CLEAR, CM_X_CLEARALL,
     CM_B_NOW, CM_B_RESTORE, CM_B_DELETE, CM_B_FOLDER,
-    CM_A_REGEDIT, CM_A_COPY
+    CM_A_REGEDIT, CM_A_COPY,
+    CM_C_TOP, CM_C_BOTTOM
 };
 
 enum { CL_MRU, CL_USERS, CL_CERTS, CL_DEVICES, CL_CREDS, CL_CACHE, CL_JUMP, CL_COUNT };
@@ -120,6 +124,28 @@ static BackupInfo *g_backups;
 static int         g_nBackups;
 static AdvRow     *g_adv;
 static int         g_nAdv, g_capAdv;
+
+/*
+ * Reordering the dropdown. A row is dragged by its handle (the dots at its
+ * left edge): a translucent copy of the row follows the pointer, and the other
+ * rows slide out of the way as it passes over them. Nothing is written to the
+ * registry until the row is dropped inside the list.
+ */
+enum { DRAG_IDLE, DRAG_ARMED, DRAG_ACTIVE };            /* armed: handle pressed, not yet moved */
+typedef struct RowAnim { int from; ULONGLONG start; } RowAnim;  /* slides from `from` pixels away; 0 = at rest */
+
+static struct {
+    int   state;
+    int   slot, origSlot;               /* the row being dragged: where it is now, where it started */
+    POINT down, pt;                     /* list client coordinates: the press, the latest position */
+    POINT grab;                         /* the press, measured from the row's top left corner */
+    HWND  ghost;                        /* the copy that follows the pointer */
+    BOOL  eatRUp;
+} g_drag;
+static RowAnim g_anim[MRU_MAX];
+static BOOL    g_animOn;
+static int     g_nMru;                  /* rows 0 .. g_nMru-1 are the dropdown, in order */
+static int     g_gripHot = -1;          /* row whose handle is under the pointer */
 
 static void RefreshView(int v);
 static void UpdateButtons(void);
@@ -345,7 +371,10 @@ static void UpdateStatus(void)
     int i, inMru = 0;
 
     text[0] = 0;
-    if (g_mstsc) {
+    if (g_drag.state == DRAG_ACTIVE) {
+        StringCchCopyW(text, ARRAY_LEN(text),
+            L"Drop the computer where you want it in the dropdown. Press Esc, or drop it outside the list, to cancel.");
+    } else if (g_mstsc) {
         warn = TRUE;
         StringCchCopyW(text, ARRAY_LEN(text),
             L"Remote Desktop Connection is open. It can overwrite the dropdown list when it connects, "
@@ -355,7 +384,8 @@ static void UpdateStatus(void)
         for (i = 0; i < g_hosts.n; i++)
             if (g_hosts.v[i].mru >= 0) inMru++;
         StringCchPrintfW(text, ARRAY_LEN(text),
-            L"%d computer%s  \u00b7  %d of %d dropdown places used  \u00b7  Right-click a computer for more options",
+            L"%d computer%s  \u00b7  %d of %d dropdown places used  \u00b7  Drag a computer by its dots to reorder "
+            L"the dropdown  \u00b7  Right-click for more options",
             g_hosts.n, g_hosts.n == 1 ? L"" : L"s", inMru, MRU_MAX);
         break;
     case V_DEFAULTS:
@@ -500,31 +530,142 @@ static BOOL NameListHas(const NameList *nl, const wchar_t *name)
     return FALSE;
 }
 
+static void FillComputerRow(HWND lv, int row, const Host *h)
+{
+    wchar_t pos[16];
+
+    if (h->mru >= 0) StringCchPrintfW(pos, ARRAY_LEN(pos), L"#%d", h->mru + 1);
+    else StringCchCopyW(pos, ARRAY_LEN(pos), DASH);
+    LV_Cell(lv, row, 0, h->name);
+    LV_Cell(lv, row, 1, pos);
+    LV_Cell(lv, row, 2, h->hasUser && h->user[0] ? h->user
+                      : h->hasCred && h->credUser[0] ? h->credUser : DASH);
+    LV_Cell(lv, row, 3, h->hasCert ? L"Trusted" : DASH);
+    LV_Cell(lv, row, 4, h->hasDevices ? L"Remembered" : DASH);
+    LV_Cell(lv, row, 5, h->hasCred ? L"Saved" : DASH);
+}
+
+static int RowHeight(void)
+{
+    RECT r;
+    if (ListView_GetItemRect(g_views[V_COMPUTERS].list, 0, &r, LVIR_BOUNDS) && r.bottom > r.top)
+        return r.bottom - r.top;
+    return S(30);
+}
+
+/* ------------------------------------------- rows sliding into place */
+
+static void InvalidateMruRows(void)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    RECT first, last, client;
+
+    if (g_nMru <= 0 || !ListView_GetItemRect(lv, 0, &first, LVIR_BOUNDS) ||
+        !ListView_GetItemRect(lv, g_nMru - 1, &last, LVIR_BOUNDS))
+        return;
+    GetClientRect(lv, &client);
+    client.top = first.top;
+    client.bottom = last.bottom;
+    InvalidateRect(lv, &client, FALSE);
+}
+
+/* How far a row is drawn from its place right now. It eases out to 0. */
+static int Anim_Dy(int row)
+{
+    ULONGLONG t;
+    LONGLONG u;
+
+    if (row < 0 || row >= MRU_MAX || !g_anim[row].from) return 0;
+    t = GetTickCount64() - g_anim[row].start;
+    if (t >= ANIM_MS) return 0;
+    u = 1000 - (LONGLONG)t * 1000 / ANIM_MS;
+    return (int)(g_anim[row].from * u * u * u / 1000000000LL);
+}
+
+static BOOL Anim_Running(void)
+{
+    ULONGLONG now = GetTickCount64();
+    int i;
+    for (i = 0; i < MRU_MAX; i++)
+        if (g_anim[i].from && now - g_anim[i].start < ANIM_MS) return TRUE;
+    return FALSE;
+}
+
+static void Anim_Kick(void)
+{
+    if (!g_animOn) {
+        g_animOn = TRUE;
+        SetTimer(g_main, TIMER_ANIM, 10, NULL);
+    }
+    InvalidateMruRows();
+}
+
+static void Anim_Tick(void)
+{
+    if (!Anim_Running()) {
+        ZeroMemory(g_anim, sizeof(g_anim));
+        g_animOn = FALSE;
+        KillTimer(g_main, TIMER_ANIM);
+    }
+    InvalidateMruRows();
+}
+
+/* While this is TRUE the dropdown rows are painted by PaintReorderRows. */
+static BOOL ReorderPainting(void)
+{
+    return g_drag.state == DRAG_ACTIVE || g_animOn;
+}
+
+/* The dropdown order before a change, so the rows can slide to their new places after it. */
+typedef struct MruSnap { wchar_t names[MRU_MAX][NAME_MAX_CCH]; int n; } MruSnap;
+
+static void Snap_Take(MruSnap *s)
+{
+    for (s->n = 0; s->n < g_nMru && s->n < MRU_MAX; s->n++)
+        StringCchCopyW(s->names[s->n], NAME_MAX_CCH, g_hosts.v[s->n].name);
+}
+
+static void Snap_Animate(const MruSnap *s)
+{
+    ULONGLONG now = GetTickCount64();
+    int h = RowHeight(), i, j;
+    BOOL any = FALSE;
+
+    for (i = 0; i < g_nMru && i < MRU_MAX; i++)
+        for (j = 0; j < s->n; j++)
+            if (j != i && str_ieq(s->names[j], g_hosts.v[i].name)) {
+                g_anim[i].from = (j - i) * h;
+                g_anim[i].start = now;
+                any = TRUE;
+            }
+    if (any) Anim_Kick();
+}
+
+static void Drag_Stop(void);
+
 static void RefreshComputers(void)
 {
     HWND lv = g_views[V_COMPUTERS].list;
-    NameList keep = SelectedHosts();
+    NameList keep;
     wchar_t focus[NAME_MAX_CCH] = L"";
-    Host *fh = HostAtRow(LV_FocusRow(lv));
+    Host *fh;
     int i;
 
+    Drag_Stop();                        /* the rows are about to be rebuilt under it */
+    ZeroMemory(g_anim, sizeof(g_anim));
+    g_gripHot = -1;
+    keep = SelectedHosts();
+    fh = HostAtRow(LV_FocusRow(lv));
     if (fh) StringCchCopyW(focus, ARRAY_LEN(focus), fh->name);
     Model_Load(&g_hosts);
+    for (g_nMru = 0; g_nMru < g_hosts.n && g_nMru < MRU_MAX && g_hosts.v[g_nMru].mru >= 0; g_nMru++) { }
 
     LV_Begin(lv);
     for (i = 0; i < g_hosts.n; i++) {
         const Host *h = &g_hosts.v[i];
-        wchar_t pos[16];
         int row = LV_Row(lv, i, h->name);
 
-        if (h->mru >= 0) StringCchPrintfW(pos, ARRAY_LEN(pos), L"#%d", h->mru + 1);
-        else StringCchCopyW(pos, ARRAY_LEN(pos), DASH);
-        LV_Cell(lv, row, 1, pos);
-        LV_Cell(lv, row, 2, h->hasUser && h->user[0] ? h->user
-                          : h->hasCred && h->credUser[0] ? h->credUser : DASH);
-        LV_Cell(lv, row, 3, h->hasCert ? L"Trusted" : DASH);
-        LV_Cell(lv, row, 4, h->hasDevices ? L"Remembered" : DASH);
-        LV_Cell(lv, row, 5, h->hasCred ? L"Saved" : DASH);
+        FillComputerRow(lv, row, h);
 
         if (NameListHas(&keep, h->name))
             ListView_SetItemState(lv, row, LVIS_SELECTED, LVIS_SELECTED);
@@ -613,16 +754,21 @@ static void Cmd_C_EditUser(void)
     RefreshView(V_COMPUTERS);
 }
 
-static void Cmd_C_Move(int delta)
+/* Moves the selected computer one place up or down the dropdown, or all the way. */
+static void Cmd_C_Move(int delta, BOOL toEdge)
 {
     Host *h = SingleHost();
     wchar_t name[NAME_MAX_CCH];
+    MruSnap snap;
 
     if (!h || h->mru < 0) return;
     StringCchCopyW(name, ARRAY_LEN(name), h->name);
     if (!EnsureRegBackup()) return;
-    Host_MoveMru(name, delta);
+    Snap_Take(&snap);
+    if (toEdge) Host_MoveMruTo(name, delta < 0 ? 0 : MRU_MAX);
+    else Host_MoveMru(name, delta);
     RefreshView(V_COMPUTERS);
+    Snap_Animate(&snap);
 }
 
 static void Cmd_C_Remove(void)
@@ -732,6 +878,12 @@ static void ShowComputerMenu(int x, int y)
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     if (notInMru) AppendMenuW(m, MF_STRING, CM_C_ADDMRU, L"Add to dropdown");
     if (inMru) AppendMenuW(m, MF_STRING, CM_C_RMMRU, L"Remove from dropdown");
+    if (inMru) {
+        const Host *h = SingleHost();
+        BOOL up = h && h->mru > 0, down = h && h->mru >= 0 && h->mru < g_nMru - 1;
+        AppendMenuW(m, MF_STRING | (up ? 0 : MF_GRAYED), CM_C_TOP, L"Move to top");
+        AppendMenuW(m, MF_STRING | (down ? 0 : MF_GRAYED), CM_C_BOTTOM, L"Move to bottom");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (user ? 0 : MF_GRAYED), CM_C_FUSER, L"Forget username");
     AppendMenuW(m, MF_STRING | (cert ? 0 : MF_GRAYED), CM_C_FCERT, L"Forget certificate");
@@ -742,6 +894,395 @@ static void ShowComputerMenu(int x, int y)
     AppendMenuW(m, MF_STRING, CM_C_REMOVE, L"Remove everything\u2026\tDel");
     TrackPopupMenuEx(m, TPM_RIGHTBUTTON, x, y, g_main, NULL);
     DestroyMenu(m);
+}
+
+/* -------------------------------------------- reordering by dragging */
+
+/* The dropdown row whose handle is at pt (list client coordinates), or -1. */
+static int GripRowAt(POINT pt)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    int i;
+
+    for (i = 0; i < g_nMru; i++) {
+        RECT r;
+        if (!ListView_GetItemRect(lv, i, &r, LVIR_BOUNDS)) continue;
+        if (pt.y >= r.top && pt.y < r.bottom && pt.x >= r.left && pt.x < r.left + S(LIST_GRIP_W))
+            return i;
+    }
+    return -1;
+}
+
+static void SetGripHot(int row)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    RECT r;
+
+    if (row == g_gripHot) return;
+    if (g_gripHot >= 0 && ListView_GetItemRect(lv, g_gripHot, &r, LVIR_BOUNDS)) InvalidateRect(lv, &r, FALSE);
+    g_gripHot = row;
+    if (row >= 0 && ListView_GetItemRect(lv, row, &r, LVIR_BOUNDS)) InvalidateRect(lv, &r, FALSE);
+}
+
+static UINT RowFlags(int row)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    UINT state = ListView_GetItemState(lv, row, LVIS_SELECTED | LVIS_FOCUSED), f = LR_GRIPSPACE;
+    const Host *h = HostAtRow(row);
+
+    if (state & LVIS_SELECTED) f |= LR_SELECTED;
+    if ((state & LVIS_FOCUSED) && !(SendMessageW(lv, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) f |= LR_FOCUS;
+    if (h && h->mru >= 0) f |= LR_GRIP;
+    if (row == g_gripHot) f |= LR_GRIPHOT;
+    return f;
+}
+
+static void DrawComputerItem(const DRAWITEMSTRUCT *di)
+{
+    int row = (int)di->itemID;
+    const Host *h = HostAtRow(row);
+    UINT f = LR_GRIPSPACE;
+
+    if (ReorderPainting() && row < g_nMru) return;      /* PaintReorderRows draws these */
+    if (h && h->mru >= 0) f |= LR_GRIP;
+    if (row == g_gripHot) f |= LR_GRIPHOT;
+    Dark_DrawListItem(di, f);
+}
+
+/*
+ * Paints the dropdown rows while they are being reordered: each one where its
+ * slide has got to, and the row being dragged faded in the place it would land.
+ */
+static void PaintReorderRows(HDC dc)
+{
+    HWND lv = g_views[V_COMPUTERS].list, header = ListView_GetHeader(lv);
+    RECT client, hr = { 0, 0, 0, 0 }, first, last, area;
+    int pass, i, saved;
+
+    if (g_nMru <= 0 || !ListView_GetItemRect(lv, 0, &first, LVIR_BOUNDS) ||
+        !ListView_GetItemRect(lv, g_nMru - 1, &last, LVIR_BOUNDS))
+        return;
+    GetClientRect(lv, &client);
+    if (header) GetWindowRect(header, &hr);
+
+    saved = SaveDC(dc);
+    IntersectClipRect(dc, 0, hr.bottom - hr.top, client.right, client.bottom);
+    SetRect(&area, 0, first.top, client.right, last.bottom);
+    FillRect(dc, &area, g_th.brBg);
+    for (pass = 0; pass < 2; pass++) {                  /* the dragged row's place first, sliding rows over it */
+        for (i = 0; i < g_nMru; i++) {
+            BOOL dragged = g_drag.state == DRAG_ACTIVE && i == g_drag.slot;
+            RECT r;
+
+            if (dragged != (pass == 0) || !ListView_GetItemRect(lv, i, &r, LVIR_BOUNDS)) continue;
+            OffsetRect(&r, 0, Anim_Dy(i));
+            Dark_DrawListRow(lv, dc, i, &r, RowFlags(i));
+            if (dragged) {
+                if (r.right < client.right) r.right = client.right;
+                Dark_Veil(dc, &r, 178);                 /* leaves the row at 30% */
+            }
+        }
+    }
+    RestoreDC(dc, saved);
+}
+
+/* Moves one element of an array from one index to another, shifting those in between. */
+static void Rotate(void *base, size_t size, int from, int to, void *tmp)
+{
+    char *b = (char *)base;
+
+    memcpy(tmp, b + (size_t)from * size, size);
+    if (from < to) memmove(b + (size_t)from * size, b + ((size_t)from + 1) * size, (size_t)(to - from) * size);
+    else memmove(b + ((size_t)to + 1) * size, b + (size_t)to * size, (size_t)(from - to) * size);
+    memcpy(b + (size_t)to * size, tmp, size);
+}
+
+/*
+ * Moves a dropdown row to another place in the list and in g_hosts, but not
+ * in the registry. The rows it passes slide over; the moved row jumps.
+ */
+static void MoveRow(int from, int to)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    int lo = from < to ? from : to, hi = from < to ? to : from, h = RowHeight(), i, tmpInt;
+    int shown[MRU_MAX] = { 0 };                         /* where each row is drawn now, slide included */
+    UINT state[MRU_MAX] = { 0 }, tmpState;
+    ULONGLONG now = GetTickCount64();
+    Host tmpHost;
+
+    if (from == to || lo < 0 || hi >= g_nMru || hi >= MRU_MAX || hi >= g_hosts.n) return;
+    for (i = lo; i <= hi; i++) {
+        shown[i] = i * h + Anim_Dy(i);
+        state[i] = ListView_GetItemState(lv, i, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    Rotate(g_hosts.v, sizeof(Host), from, to, &tmpHost);
+    Rotate(shown, sizeof(shown[0]), from, to, &tmpInt);
+    Rotate(state, sizeof(state[0]), from, to, &tmpState);
+
+    g_populating = TRUE;                                /* selection moves with its row; nothing new is selected */
+    for (i = lo; i <= hi; i++) {
+        g_hosts.v[i].mru = i;
+        g_anim[i].from = i == to ? 0 : shown[i] - i * h;
+        g_anim[i].start = now;
+        FillComputerRow(lv, i, &g_hosts.v[i]);
+        ListView_SetItemState(lv, i, state[i], LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    g_populating = FALSE;
+    Anim_Kick();
+}
+
+/* Follows the pointer: moves the copy of the row and, inside the list, the row itself. */
+static void Drag_Track(void)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    POINT screen = g_drag.pt;
+    RECT client, r0;
+    BOOL inside;
+
+    if (g_drag.state != DRAG_ACTIVE) return;
+    GetClientRect(lv, &client);
+    inside = PtInRect(&client, g_drag.pt);
+    ClientToScreen(lv, &screen);
+    if (g_drag.ghost)
+        SetWindowPos(g_drag.ghost, NULL, screen.x - g_drag.grab.x, screen.y - g_drag.grab.y, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetCursor(LoadCursorW(NULL, inside ? IDC_SIZENS : IDC_NO));
+
+    if (inside && g_nMru > 0 && ListView_GetItemRect(lv, 0, &r0, LVIR_BOUNDS) && r0.bottom > r0.top) {
+        int slot = g_drag.pt.y < r0.top ? 0 : (g_drag.pt.y - r0.top) / (r0.bottom - r0.top);
+        if (slot > g_nMru - 1) slot = g_nMru - 1;
+        if (slot != g_drag.slot) {
+            MoveRow(g_drag.slot, slot);
+            g_drag.slot = slot;
+        }
+    }
+}
+
+/* The handle has been pulled far enough: lift the row. */
+static void Drag_Begin(void)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    RECT row, client;
+    HDC screen, mem;
+    HBITMAP bmp;
+    int w, h;
+
+    if (!ListView_GetItemRect(lv, g_drag.slot, &row, LVIR_BOUNDS)) {
+        Drag_Stop();
+        return;
+    }
+    GetClientRect(lv, &client);
+    w = client.right;
+    h = row.bottom - row.top;
+    g_drag.state = DRAG_ACTIVE;
+    g_drag.grab.x = g_drag.down.x;
+    g_drag.grab.y = g_drag.down.y - row.top;
+    SetGripHot(-1);
+
+    /* the copy that follows the pointer: a click-through window showing the row at half strength */
+    g_drag.ghost = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                   L"STATIC", NULL, WS_POPUP, 0, 0, w, h, g_main, NULL, g_inst, NULL);
+    screen = GetDC(NULL);
+    mem = screen ? CreateCompatibleDC(screen) : NULL;
+    bmp = screen ? CreateCompatibleBitmap(screen, w, h) : NULL;
+    if (g_drag.ghost && mem && bmp) {
+        HGDIOBJ old = SelectObject(mem, bmp);
+        RECT at = { row.left, 0, row.right, h }, frame = { 0, 0, w, h };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 128, 0 };
+        POINT src = { 0, 0 }, dst = g_drag.pt;
+        SIZE size = { w, h };
+
+        Dark_DrawListRow(lv, mem, g_drag.slot, &at, RowFlags(g_drag.slot) | LR_GRIPHOT);
+        FrameRect(mem, &frame, g_th.brBorder);
+        ClientToScreen(lv, &dst);
+        dst.x -= g_drag.grab.x;
+        dst.y -= g_drag.grab.y;
+        UpdateLayeredWindow(g_drag.ghost, screen, &dst, &size, mem, &src, 0, &bf, ULW_ALPHA);
+        ShowWindow(g_drag.ghost, SW_SHOWNOACTIVATE);
+        SelectObject(mem, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    if (screen) ReleaseDC(NULL, screen);
+
+    SetTimer(g_main, TIMER_DRAG, 80, NULL);
+    InvalidateMruRows();
+    UpdateStatus();
+}
+
+static void Drag_Move(POINT pt)
+{
+    g_drag.pt = pt;
+    if (g_drag.state == DRAG_ARMED) {
+        if (abs(pt.x - g_drag.down.x) < S(6) && abs(pt.y - g_drag.down.y) < S(6)) return;
+        Drag_Begin();
+    }
+    Drag_Track();
+}
+
+/* Keeps the list scrolling while the row is held near its top or bottom edge. */
+static void Drag_Tick(void)
+{
+    HWND lv = g_views[V_COMPUTERS].list, header = ListView_GetHeader(lv);
+    RECT client, hr = { 0, 0, 0, 0 }, last;
+    int top, h = RowHeight();
+
+    if (g_drag.state != DRAG_ACTIVE) return;
+    GetClientRect(lv, &client);
+    if (!PtInRect(&client, g_drag.pt)) return;
+    if (header) GetWindowRect(header, &hr);
+    top = ListView_GetTopIndex(lv);
+    if (g_drag.pt.y < hr.bottom - hr.top + S(24)) {
+        ListView_Scroll(lv, 0, -h);
+    } else if (g_drag.pt.y >= client.bottom - S(24) && g_nMru > 0 &&
+               ListView_GetItemRect(lv, g_nMru - 1, &last, LVIR_BOUNDS) && last.bottom > client.bottom) {
+        ListView_Scroll(lv, 0, h);                      /* only while dropdown rows are still out of sight */
+    }
+    if (ListView_GetTopIndex(lv) != top) {
+        InvalidateRect(lv, NULL, FALSE);
+        Drag_Track();
+    }
+}
+
+/* Ends a drag where it stands. The rows stay as they are on screen. */
+static void Drag_Stop(void)
+{
+    HWND lv = g_views[V_COMPUTERS].list;
+    int was = g_drag.state;
+
+    if (was == DRAG_IDLE) return;
+    g_drag.state = DRAG_IDLE;                           /* first: releasing the capture comes back here */
+    KillTimer(g_main, TIMER_DRAG);
+    if (g_drag.ghost) {
+        DestroyWindow(g_drag.ghost);
+        g_drag.ghost = NULL;
+    }
+    if (GetCapture() == lv) ReleaseCapture();
+    if (was == DRAG_ACTIVE) {
+        InvalidateMruRows();
+        UpdateStatus();
+    }
+}
+
+/* Ends a drag: saves the new order when the row was dropped in the list, else puts it back. */
+static void Drag_End(BOOL dropped)
+{
+    BOOL moved = g_drag.state == DRAG_ACTIVE && g_drag.slot != g_drag.origSlot;
+    int to = g_drag.slot;
+    wchar_t name[NAME_MAX_CCH];
+    RowAnim keep[MRU_MAX];
+
+    if (g_drag.state == DRAG_IDLE) return;
+    Drag_Stop();
+    if (!moved) return;
+    if (!dropped || to < 0 || to >= g_hosts.n || !EnsureRegBackup()) {
+        RefreshView(V_COMPUTERS);                       /* reloading puts every row back */
+        return;
+    }
+    StringCchCopyW(name, ARRAY_LEN(name), g_hosts.v[to].name);
+    if (!Host_MoveMruTo(name, to)) {
+        RefreshView(V_COMPUTERS);
+        Dark_Info(g_main, L"Reorder", L"The dropdown list couldn't be updated.");
+        return;
+    }
+    memcpy(keep, g_anim, sizeof(keep));                 /* let the rows finish sliding */
+    RefreshView(V_COMPUTERS);
+    memcpy(g_anim, keep, sizeof(keep));
+    if (Anim_Running()) Anim_Kick();
+}
+
+static LRESULT CALLBACK ComputersListProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref)
+{
+    POINT pt;
+    RECT client;
+
+    (void)ref;
+    switch (m) {
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        if (g_drag.state != DRAG_IDLE) return 0;
+        pt.x = GET_X_LPARAM(l);
+        pt.y = GET_Y_LPARAM(l);
+        if (GripRowAt(pt) >= 0) {
+            /* a press on the handle only readies a drag; it doesn't change the selection */
+            g_drag.state = DRAG_ARMED;
+            g_drag.slot = g_drag.origSlot = GripRowAt(pt);
+            g_drag.down = g_drag.pt = pt;
+            if (GetFocus() != h) SetFocus(h);
+            SetCapture(h);
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        pt.x = GET_X_LPARAM(l);
+        pt.y = GET_Y_LPARAM(l);
+        if (g_drag.state != DRAG_IDLE) {
+            Drag_Move(pt);
+            return 0;
+        }
+        SetGripHot(GripRowAt(pt));
+        if (g_gripHot >= 0) {
+            TRACKMOUSEEVENT t;
+            t.cbSize = sizeof(t);
+            t.dwFlags = TME_LEAVE;
+            t.hwndTrack = h;
+            t.dwHoverTime = 0;
+            TrackMouseEvent(&t);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        SetGripHot(-1);
+        break;
+    case WM_LBUTTONUP:
+        if (g_drag.state != DRAG_IDLE) {
+            pt.x = GET_X_LPARAM(l);
+            pt.y = GET_Y_LPARAM(l);
+            GetClientRect(h, &client);
+            Drag_End(PtInRect(&client, pt));
+            return 0;
+        }
+        break;
+    case WM_RBUTTONDOWN:
+        g_drag.eatRUp = g_drag.state != DRAG_IDLE;
+        if (g_drag.eatRUp) {                            /* the other button cancels, and opens no menu */
+            Drag_End(FALSE);
+            return 0;
+        }
+        break;
+    case WM_RBUTTONUP:
+        if (g_drag.eatRUp) {
+            g_drag.eatRUp = FALSE;
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (g_drag.state != DRAG_IDLE && (HWND)l != h) Drag_End(FALSE);
+        break;
+    case WM_SETCURSOR:
+        if ((HWND)w == h && LOWORD(l) == HTCLIENT && g_drag.state == DRAG_IDLE) {
+            DWORD pos = GetMessagePos();
+            pt.x = GET_X_LPARAM(pos);
+            pt.y = GET_Y_LPARAM(pos);
+            ScreenToClient(h, &pt);
+            if (GripRowAt(pt) >= 0) {
+                SetCursor(LoadCursorW(NULL, IDC_SIZENS));
+                return TRUE;
+            }
+        }
+        break;
+    case WM_MOUSEWHEEL: {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        if (g_drag.state == DRAG_ACTIVE) {
+            InvalidateRect(h, NULL, FALSE);
+            Drag_Track();
+        }
+        return r;
+    }
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(h, ComputersListProc, id);
+        break;
+    }
+    return DefSubclassProc(h, m, w, l);
 }
 
 /* ------------------------------------------------- connection defaults */
@@ -1380,8 +1921,10 @@ static void OnCommand(int id)
     case CM_C_ADD:      Cmd_C_Add(); break;
     case CM_C_CONNECT:  Cmd_C_Connect(); break;
     case CM_C_USER:     Cmd_C_EditUser(); break;
-    case CM_C_UP:       Cmd_C_Move(-1); break;
-    case CM_C_DOWN:     Cmd_C_Move(1); break;
+    case CM_C_UP:       Cmd_C_Move(-1, FALSE); break;
+    case CM_C_DOWN:     Cmd_C_Move(1, FALSE); break;
+    case CM_C_TOP:      Cmd_C_Move(-1, TRUE); break;
+    case CM_C_BOTTOM:   Cmd_C_Move(1, TRUE); break;
     case CM_C_REMOVE:   Cmd_C_Remove(); break;
     case CM_C_COPY:     Cmd_C_Copy(); break;
     case CM_C_MORE: {
@@ -1487,6 +2030,7 @@ static LRESULT OnNotify(NMHDR *nm, LPARAM lParam)
                 DrawTextW(cd->nmcd.hdc, g_views[v].empty, -1, &rc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
                 SelectObject(cd->nmcd.hdc, old);
             }
+            if (v == V_COMPUTERS && ReorderPainting()) PaintReorderRows(cd->nmcd.hdc);
         }
         return CDRF_DODEFAULT;
     }
@@ -1516,7 +2060,8 @@ static void CreateChildren(HWND hwnd)
                                   WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS |
                                   LVS_OWNERDRAWFIXED | LVS_NOSORTHEADER | v->listStyle,
                                   0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)(ID_LIST_BASE + i), g_inst, NULL);
-        Dark_SetupListView(v->list);
+        Dark_SetupListView(v->list, i == V_COMPUTERS);
+        if (i == V_COMPUTERS) SetWindowSubclass(v->list, ComputersListProc, 2, 0);
         for (c = 0; c < v->ncols; c++) {
             LVCOLUMNW col;
             ZeroMemory(&col, sizeof(col));
@@ -1588,7 +2133,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT m, WPARAM w, LPARAM l)
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT *di = (const DRAWITEMSTRUCT *)l;
         if (di->CtlType == ODT_BUTTON) Dark_DrawButton(di);
-        else if (di->CtlType == ODT_LISTVIEW) Dark_DrawListItem(di);
+        else if (di->CtlType == ODT_LISTVIEW) {
+            if (di->hwndItem == g_views[V_COMPUTERS].list) DrawComputerItem(di);
+            else Dark_DrawListItem(di, 0);
+        }
         return TRUE;
     }
 
@@ -1621,6 +2169,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT m, WPARAM w, LPARAM l)
                 g_mstsc = running;
                 UpdateStatus();
             }
+        } else if (w == TIMER_ANIM) {
+            Anim_Tick();
+        } else if (w == TIMER_DRAG) {
+            Drag_Tick();
         }
         return 0;
 
@@ -1642,6 +2194,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT m, WPARAM w, LPARAM l)
         break;
 
     case WM_DESTROY:
+        Drag_Stop();
+        KillTimer(hwnd, TIMER_ANIM);
         KillTimer(hwnd, TIMER_MSTSC);
         g_ready = FALSE;
         Model_Free(&g_hosts);
@@ -1663,6 +2217,10 @@ BOOL Main_PreTranslate(MSG *msg)
     if (!g_main || g_modalDepth) return FALSE;
     if (msg->hwnd != g_main && !IsChild(g_main, msg->hwnd)) return FALSE;
 
+    if (g_drag.state != DRAG_IDLE && (msg->message == WM_KEYDOWN || msg->message == WM_SYSKEYDOWN)) {
+        if (msg->wParam == VK_ESCAPE) Drag_End(FALSE);
+        return TRUE;                    /* no other shortcut runs in the middle of a drag */
+    }
     if (msg->message == WM_KEYDOWN) {
         if (msg->wParam == VK_F5) {
             RefreshView(g_view);
@@ -1676,7 +2234,7 @@ BOOL Main_PreTranslate(MSG *msg)
     if (msg->message == WM_SYSKEYDOWN && g_view == V_COMPUTERS &&
         (msg->wParam == VK_UP || msg->wParam == VK_DOWN) &&
         GetFocus() == g_views[V_COMPUTERS].list) {
-        Cmd_C_Move(msg->wParam == VK_UP ? -1 : 1);
+        Cmd_C_Move(msg->wParam == VK_UP ? -1 : 1, FALSE);
         return TRUE;
     }
     return FALSE;

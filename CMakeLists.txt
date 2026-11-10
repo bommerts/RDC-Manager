@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RDCManager VERSION 1.0.0 LANGUAGES C RC)
+project(RDCManager VERSION 1.1.0 LANGUAGES C RC)
 
 if(NOT MSVC)
     message(FATAL_ERROR "RDC Manager is built with the Microsoft C compiler (MSVC).")

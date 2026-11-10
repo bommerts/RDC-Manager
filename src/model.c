@@ -393,6 +393,28 @@ BOOL Host_MoveMru(const wchar_t *host, int delta)
     return Mru_Write(cur, n);
 }
 
+/*
+ * Moves a dropdown entry to a given place (0 = top), keeping the others in
+ * their order. A place past the end means the bottom.
+ */
+BOOL Host_MoveMruTo(const wchar_t *host, int to)
+{
+    wchar_t cur[MRU_MAX][NAME_MAX_CCH], tmp[NAME_MAX_CCH];
+    int n = Mru_Read(cur), at, i;
+
+    if (n > MRU_MAX) n = MRU_MAX;
+    at = mru_index(cur, n, host);
+    if (at < 0) return FALSE;
+    if (to < 0) to = 0;
+    if (to > n - 1) to = n - 1;
+    if (to == at) return TRUE;
+    StringCchCopyW(tmp, NAME_MAX_CCH, cur[at]);
+    for (i = at; i < to; i++) StringCchCopyW(cur[i], NAME_MAX_CCH, cur[i + 1]);
+    for (i = at; i > to; i--) StringCchCopyW(cur[i], NAME_MAX_CCH, cur[i - 1]);
+    StringCchCopyW(cur[to], NAME_MAX_CCH, tmp);
+    return Mru_Write(cur, n);
+}
+
 /* -------------------------------------------------------- per-host data */
 
 static BOOL server_path(const wchar_t *host, wchar_t *out, size_t cch)

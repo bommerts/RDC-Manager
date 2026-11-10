@@ -36,7 +36,7 @@
 #include <strsafe.h>
 
 #define RDCM_NAME     L"RDC Manager"
-#define RDCM_VERSION  L"1.0.0"
+#define RDCM_VERSION  L"1.1.0"
 #define RDCM_URL      L"https://github.com/bommerts/RDC-Manager"
 
 /* The registry key (under HKEY_CURRENT_USER) where mstsc keeps its per-user data. */
@@ -137,6 +137,7 @@ BOOL Mru_Write(wchar_t names[][NAME_MAX_CCH], int count);
 BOOL Host_AddToMru(const wchar_t *host);        /* puts it at the top */
 BOOL Host_RemoveFromMru(const wchar_t *host);
 BOOL Host_MoveMru(const wchar_t *host, int delta);
+BOOL Host_MoveMruTo(const wchar_t *host, int to);
 BOOL Host_SetUser(const wchar_t *host, const wchar_t *user);
 BOOL Host_ClearUser(const wchar_t *host);
 BOOL Host_ClearCert(const wchar_t *host);

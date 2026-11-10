@@ -6,7 +6,7 @@ Windows gives you no way to edit the dropdown list in Remote Desktop Connection,
 
 ![RDC Manager showing a list of remembered computers](docs/screenshot.png)
 
-- One file, about 140 KB. Nothing to install and no runtime to download.
+- One file, about 150 KB. Nothing to install and no runtime to download.
 - Written in plain C against the Windows API. No frameworks.
 - Dark mode only.
 - Every change is backed up first and can be restored from inside the app.
@@ -28,6 +28,14 @@ The exe is not code-signed, so Windows SmartScreen may show a warning the first 
 | **Advanced** | Read-only view of other Remote Desktop client settings, including Group Policy. | Other values under the keys above, and `HKLM` |
 
 The Computers page shows one row per computer, combining all the places a computer can be remembered. Computers that are no longer in the dropdown but still have leftover data show up too.
+
+### Reordering the dropdown
+
+Each computer that is in the dropdown has a handle at the left of its row: two columns of dots. Drag a row by its handle to move it. A copy of the row follows the pointer and the other rows slide out of the way as you go. Drop it inside the list to save the new order. To cancel, press `Esc` or drop it outside the list.
+
+You can also right-click a computer and choose **Move to top** or **Move to bottom**, or use the **Move up** and **Move down** buttons.
+
+Computers that are not in the dropdown have no handle, because Remote Desktop keeps no order for them. Right-click one and choose **Add to dropdown** first.
 
 ## Backups and undo
 
@@ -62,6 +70,7 @@ Demo mode runs the whole app against made-up sample data. It does not read or ch
 | `Del` | Remove or delete the selection |
 | `F2` | Edit username or setting |
 | `Alt+Up`, `Alt+Down` | Move a computer up or down the dropdown |
+| `Esc` | Cancel a drag |
 | `Ctrl+C` | Copy the computer name |
 | `Shift+F10` | Open the right-click menu |
 

@@ -274,7 +274,6 @@ void Dark_DrawButton(const DRAWITEMSTRUCT *di)
 /* Paints the column header ourselves; the stock one can't be made dark. */
 static LRESULT CALLBACK HeaderProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref)
 {
-    (void)ref;
     switch (m) {
     case WM_ERASEBKGND:
         return 1;
@@ -301,7 +300,7 @@ static LRESULT CALLBACK HeaderProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR 
             text[0] = 0;
             if (!Header_GetItemRect(h, i, &r) || !Header_GetItem(h, i, &it)) continue;
             t = r;
-            t.left += S(10);
+            t.left += i == 0 && ref ? S(LIST_GRIP_W) : S(10);     /* ref: rows have a drag handle */
             t.right -= S(6);
             if (t.right > t.left)
                 DrawTextW(dc, text, -1, &t, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -335,7 +334,8 @@ static LRESULT CALLBACK HeaderProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR 
     return DefSubclassProc(h, m, w, l);
 }
 
-void Dark_SetupListView(HWND list)
+/* grip: the rows keep room on the left for a drag handle (see LR_GRIP). */
+void Dark_SetupListView(HWND list, BOOL grip)
 {
     HWND header = ListView_GetHeader(list);
 
@@ -345,7 +345,7 @@ void Dark_SetupListView(HWND list)
     ListView_SetTextBkColor(list, C_BG);
     ListView_SetTextColor(list, C_TEXT);
     SendMessageW(list, WM_SETFONT, (WPARAM)g_th.font, FALSE);
-    if (header) SetWindowSubclass(header, HeaderProc, 1, 0);
+    if (header) SetWindowSubclass(header, HeaderProc, 1, (DWORD_PTR)(grip != FALSE));
 }
 
 /* Makes the list ask for its row height again (after a dpi change). */
@@ -363,18 +363,65 @@ void Dark_RemeasureListView(HWND list)
     SendMessageW(list, WM_WINDOWPOSCHANGED, 0, (LPARAM)&wp);
 }
 
-/* Draws one row. A cell holding just an em dash means "nothing here" and is dimmed. */
-void Dark_DrawListItem(const DRAWITEMSTRUCT *di)
+/*
+ * The drag handle, a "dot-hamburger": two columns of three dots. The dots are
+ * only two or three pixels across, so they are drawn four times too big and
+ * scaled down, which rounds and smooths them.
+ */
+static void draw_grip(HDC dc, const RECT *row, COLORREF bg, COLORREF fg)
 {
-    HWND list = di->hwndItem, header = ListView_GetHeader(list);
-    HDC dc = di->hDC;
-    RECT rc = di->rcItem, client;
-    BOOL selected = (di->itemState & ODS_SELECTED) != 0;
+    enum { SS = 4 };                                    /* supersampling factor */
+    int w = S(9), h = S(14), unit = MulDiv(SS, g_th.dpi ? g_th.dpi : 96, 96);
+    int x = row->left + (S(LIST_GRIP_W) - w) / 2 + S(1);
+    int y = row->top + (row->bottom - row->top - h) / 2;
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, w * SS, h * SS);
+    RECT all = { 0, 0, w * SS, h * SS };
+    HBRUSH brBg = CreateSolidBrush(bg), brFg = CreateSolidBrush(fg);
+    HGDIOBJ oldBmp, oldBr, oldPen;
+    POINT org;
+    int cx, cy;
+
+    if (!mem || !bmp || !brBg || !brFg) goto done;
+    oldBmp = SelectObject(mem, bmp);
+    FillRect(mem, &all, brBg);
+    oldBr = SelectObject(mem, brFg);
+    oldPen = SelectObject(mem, GetStockObject(NULL_PEN));
+    /* dot centres on a 9 x 14 grid (in tenths), dot radius 1.4 */
+    for (cx = 25; cx <= 65; cx += 40)
+        for (cy = 25; cy <= 115; cy += 45)
+            Ellipse(mem, MulDiv(cx - 14, unit, 10), MulDiv(cy - 14, unit, 10),
+                         MulDiv(cx + 14, unit, 10) + 1, MulDiv(cy + 14, unit, 10) + 1);
+    SetStretchBltMode(dc, HALFTONE);
+    GetBrushOrgEx(dc, &org);
+    SetBrushOrgEx(dc, org.x, org.y, NULL);              /* HALFTONE asks for the origin to be set again */
+    StretchBlt(dc, x, y, w, h, mem, 0, 0, w * SS, h * SS, SRCCOPY);
+    SelectObject(mem, oldPen);
+    SelectObject(mem, oldBr);
+    SelectObject(mem, oldBmp);
+done:
+    if (brBg) DeleteObject(brBg);
+    if (brFg) DeleteObject(brFg);
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+}
+
+/*
+ * Draws one row of a list at a given place, which need not be where the list
+ * keeps it (rows slide while they are being reordered).
+ * A cell holding just an em dash means "nothing here" and is dimmed.
+ */
+void Dark_DrawListRow(HWND list, HDC dc, int item, const RECT *at, UINT flags)
+{
+    HWND header = ListView_GetHeader(list);
+    RECT rc = *at, client;
+    BOOL selected = (flags & LR_SELECTED) != 0;
     BOOL active = GetFocus() == list;
+    COLORREF bg = selected ? (active ? C_SEL : C_SEL_INACTIVE) : C_BG;
     int cols = header ? Header_GetItemCount(header) : 0, c;
     HGDIOBJ old;
 
-    if ((int)di->itemID < 0) return;
+    if (item < 0) return;
     /* a row always spans the whole list, even if the columns stop short of the edge */
     GetClientRect(list, &client);
     if (rc.right < client.right) rc.right = client.right;
@@ -384,6 +431,8 @@ void Dark_DrawListItem(const DRAWITEMSTRUCT *di)
         line.top = rc.bottom - 1;
         FillRect(dc, &line, g_th.brLine);
     }
+    if (flags & LR_GRIP)
+        draw_grip(dc, &rc, bg, (flags & LR_GRIPHOT) ? C_TEXT : selected ? RGB(165, 175, 185) : RGB(118, 118, 118));
 
     old = SelectObject(dc, g_th.font);
     SetBkMode(dc, TRANSPARENT);
@@ -392,13 +441,13 @@ void Dark_DrawListItem(const DRAWITEMSTRUCT *di)
         RECT hr, cell;
 
         if (!Header_GetItemRect(header, c, &hr)) continue;
-        cell.left = rc.left + hr.left + S(10);
+        cell.left = rc.left + hr.left + (c == 0 && (flags & LR_GRIPSPACE) ? S(LIST_GRIP_W) : S(10));
         cell.right = rc.left + hr.right - S(6);
         cell.top = rc.top;
         cell.bottom = rc.bottom;
         if (cell.right <= cell.left) continue;
         text[0] = 0;
-        ListView_GetItemText(list, (int)di->itemID, c, text, ARRAY_LEN(text));
+        ListView_GetItemText(list, item, c, text, ARRAY_LEN(text));
         if (text[0] == 0x2014 && text[1] == 0)
             SetTextColor(dc, selected ? RGB(170, 170, 170) : C_DISABLED);
         else
@@ -407,8 +456,34 @@ void Dark_DrawListItem(const DRAWITEMSTRUCT *di)
     }
     SelectObject(dc, old);
 
-    if ((di->itemState & ODS_FOCUS) && active && !(di->itemState & ODS_NOFOCUSRECT))
+    if ((flags & LR_FOCUS) && active)
         FrameRect(dc, &rc, g_th.brAccent);
+}
+
+void Dark_DrawListItem(const DRAWITEMSTRUCT *di, UINT flags)
+{
+    if (di->itemState & ODS_SELECTED) flags |= LR_SELECTED;
+    if ((di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT)) flags |= LR_FOCUS;
+    Dark_DrawListRow(di->hwndItem, di->hDC, (int)di->itemID, &di->rcItem, flags);
+}
+
+/* Fades whatever is drawn in rc towards the window colour. alpha 255 hides it. */
+void Dark_Veil(HDC dc, const RECT *rc, BYTE alpha)
+{
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, 1, 1);
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 0, 0 };
+
+    bf.SourceConstantAlpha = alpha;
+    if (mem && bmp) {
+        HGDIOBJ old = SelectObject(mem, bmp);
+        SetPixelV(mem, 0, 0, C_BG);
+        GdiAlphaBlend(dc, rc->left, rc->top, rc->right - rc->left, rc->bottom - rc->top,
+                      mem, 0, 0, 1, 1, bf);
+        SelectObject(mem, old);
+    }
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
 }
 
 /* -------------------------------------------------------------- dialogs */

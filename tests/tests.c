@@ -201,6 +201,28 @@ static void test_mru(void)
     n = Mru_Read(m);
     CHECK(n == MRU_MAX && str_ieq(m[0], L"pc11") && str_ieq(m[9], L"pc02"));
 
+    /* moving one entry to a place keeps every other entry in order */
+    CHECK(Host_MoveMruTo(L"pc11", 3));                       /* down from the top */
+    n = Mru_Read(m);
+    CHECK(n == MRU_MAX && str_ieq(m[0], L"pc10") && str_ieq(m[1], L"pc09") && str_ieq(m[2], L"pc08"));
+    CHECK(str_ieq(m[3], L"pc11") && str_ieq(m[4], L"pc07") && str_ieq(m[9], L"pc02"));
+    CHECK(Host_MoveMruTo(L"PC03", 1));                       /* up, and names match without case */
+    n = Mru_Read(m);
+    CHECK(n == MRU_MAX && str_ieq(m[0], L"pc10") && str_ieq(m[1], L"pc03") && str_ieq(m[2], L"pc09"));
+    CHECK(str_ieq(m[4], L"pc11") && str_ieq(m[8], L"pc04") && str_ieq(m[9], L"pc02"));
+    CHECK(Host_MoveMruTo(L"pc10", 99));                      /* past the end means the bottom */
+    n = Mru_Read(m);
+    CHECK(n == MRU_MAX && str_ieq(m[0], L"pc03") && str_ieq(m[8], L"pc02") && str_ieq(m[9], L"pc10"));
+    CHECK(Host_MoveMruTo(L"pc10", -5));                      /* before the start means the top */
+    n = Mru_Read(m);
+    CHECK(n == MRU_MAX && str_ieq(m[0], L"pc10") && str_ieq(m[1], L"pc03") && str_ieq(m[9], L"pc02"));
+    CHECK(Host_MoveMruTo(L"pc03", 1));                       /* already there: nothing changes */
+    n = Mru_Read(m);
+    CHECK(n == MRU_MAX && str_ieq(m[0], L"pc10") && str_ieq(m[1], L"pc03") && str_ieq(m[2], L"pc09"));
+    CHECK(!Host_MoveMruTo(L"not-there", 0));
+    CHECK(Mru_Read(m) == MRU_MAX);
+    CHECK(value_exists(L"Default", L"SomethingElse"));
+
     CHECK(Mru_Write(NULL, 0));
     CHECK(Mru_Read(m) == 0);
     CHECK(value_exists(L"Default", L"SomethingElse"));

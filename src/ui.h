@@ -63,8 +63,20 @@ BOOL Dark_PreTranslate(MSG *msg);
 HWND Dark_CreateButton(HWND parent, int id, const wchar_t *text, int kind);
 void Dark_DrawButton(const DRAWITEMSTRUCT *di);
 
-void Dark_SetupListView(HWND list);
-void Dark_DrawListItem(const DRAWITEMSTRUCT *di);
+/* How a list row is drawn. */
+enum {
+    LR_SELECTED  = 0x01,
+    LR_FOCUS     = 0x02,            /* show the keyboard focus frame */
+    LR_GRIPSPACE = 0x04,            /* keep room on the left for a drag handle */
+    LR_GRIP      = 0x08,            /* draw the handle (a "dot-hamburger") there */
+    LR_GRIPHOT   = 0x10             /* the pointer is on the handle */
+};
+#define LIST_GRIP_W 30              /* width of the handle area, in 96-dpi pixels */
+
+void Dark_SetupListView(HWND list, BOOL grip);
+void Dark_DrawListRow(HWND list, HDC dc, int item, const RECT *at, UINT flags);
+void Dark_DrawListItem(const DRAWITEMSTRUCT *di, UINT flags);
+void Dark_Veil(HDC dc, const RECT *rc, BYTE alpha);
 void Dark_RemeasureListView(HWND list);
 
 /* Returns IDOK or IDCANCEL. cancelLabel may be NULL for a single-button dialog. */
